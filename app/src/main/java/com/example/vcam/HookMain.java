@@ -19,9 +19,11 @@ import android.hardware.camera2.params.InputConfiguration;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.media.MediaPlayer;
+import android.media.MediaMetadataRetriever;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
+import android.util.Size;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.widget.Toast;
@@ -93,6 +95,43 @@ public class HookMain implements IXposedHookLoadPackage {
 
     public static Class c2_state_callback;
     public Context toast_content;
+
+    public static int cached_video_width = 0;
+    public static int cached_video_height = 0;
+    public static String last_video_path = "";
+
+    public static void updateVideoResolution(String path) {
+        if (path == null) return;
+        if (path.equals(last_video_path) && cached_video_width != 0) {
+            return;
+        }
+        File file = new File(path);
+        if (!file.exists()) {
+            return;
+        }
+        try {
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            retriever.setDataSource(path);
+            String width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH);
+            String height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT);
+            String rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+
+            if (width != null && height != null) {
+                cached_video_width = Integer.parseInt(width);
+                cached_video_height = Integer.parseInt(height);
+
+                if (rotation != null && (rotation.equals("90") || rotation.equals("270"))) {
+                    int temp = cached_video_width;
+                    cached_video_width = cached_video_height;
+                    cached_video_height = temp;
+                }
+                last_video_path = path;
+            }
+            retriever.release();
+        } catch (Exception e) {
+            XposedBridge.log("【VCAM】Error reading video resolution: " + e.toString());
+        }
+    }
 
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
         XposedHelpers.findAndHookMethod("android.hardware.Camera", lpparam.classLoader, "setPreviewTexture", SurfaceTexture.class, new XC_MethodHook() {
@@ -686,6 +725,46 @@ public class HookMain implements IXposedHookLoadPackage {
 
                     }
                 });
+
+        XposedHelpers.findAndHookMethod("android.hardware.Camera", lpparam.classLoader, "getParameters", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                String path = video_path + "virtual.mp4";
+                updateVideoResolution(path);
+                if (cached_video_width > 0 && cached_video_height > 0) {
+                    Camera.Parameters parameters = (Camera.Parameters) param.getResult();
+                    String size = cached_video_width + "x" + cached_video_height;
+                    parameters.set("preview-size-values", size);
+                    parameters.set("picture-size-values", size);
+                    parameters.set("video-size-values", size);
+                    param.setResult(parameters);
+                }
+            }
+        });
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            XposedHelpers.findAndHookMethod("android.hardware.camera2.params.StreamConfigurationMap", lpparam.classLoader, "getOutputSizes", Class.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    String path = video_path + "virtual.mp4";
+                    updateVideoResolution(path);
+                    if (cached_video_width > 0 && cached_video_height > 0) {
+                        param.setResult(new Size[]{new Size(cached_video_width, cached_video_height)});
+                    }
+                }
+            });
+
+            XposedHelpers.findAndHookMethod("android.hardware.camera2.params.StreamConfigurationMap", lpparam.classLoader, "getOutputSizes", int.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    String path = video_path + "virtual.mp4";
+                    updateVideoResolution(path);
+                    if (cached_video_width > 0 && cached_video_height > 0) {
+                        param.setResult(new Size[]{new Size(cached_video_width, cached_video_height)});
+                    }
+                }
+            });
+        }
     }
 
     private void process_camera2_play() {
