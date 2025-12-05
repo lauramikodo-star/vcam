@@ -22,6 +22,7 @@ import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
+import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.widget.Toast;
@@ -95,10 +96,19 @@ public class HookMain implements IXposedHookLoadPackage {
     public Context toast_content;
 
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
+        XposedBridge.log("【VCAM】加载包名：" + lpparam.packageName);
+        Log.d("VCAM_DEBUG", "Loaded package: " + lpparam.packageName);
+
         XposedHelpers.findAndHookMethod("android.hardware.Camera", lpparam.classLoader, "setPreviewTexture", SurfaceTexture.class, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
+                XposedBridge.log("【VCAM】setPreviewTexture called");
+                Log.d("VCAM_DEBUG", "setPreviewTexture called in " + lpparam.packageName);
                 File file = new File(video_path + "virtual.mp4");
+                if (!file.exists()) {
+                    XposedBridge.log("【VCAM】virtual.mp4 does not exist at " + video_path);
+                    Log.d("VCAM_DEBUG", "virtual.mp4 does not exist at " + video_path);
+                }
                 if (file.exists()) {
                     File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
                     if (control_file.exists()){
@@ -148,6 +158,8 @@ public class HookMain implements IXposedHookLoadPackage {
         XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraManager", lpparam.classLoader, "openCamera", String.class, CameraDevice.StateCallback.class, Handler.class, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                XposedBridge.log("【VCAM】openCamera (API < P) called");
+                Log.d("VCAM_DEBUG", "openCamera (API < P) called");
                 if (param.args[1] == null) {
                     return;
                 }
@@ -164,6 +176,8 @@ public class HookMain implements IXposedHookLoadPackage {
                 File toast_control = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "no_toast.jpg");
                 need_to_show_toast = !toast_control.exists();
                 if (!file.exists()) {
+                    XposedBridge.log("【VCAM】virtual.mp4 does not exist at " + video_path);
+                    Log.d("VCAM_DEBUG", "virtual.mp4 does not exist at " + video_path);
                     if (toast_content != null && need_to_show_toast) {
                         try {
                             Toast.makeText(toast_content, "不存在替换视频\n" + lpparam.packageName + "当前路径：" + video_path, Toast.LENGTH_SHORT).show();
@@ -184,6 +198,8 @@ public class HookMain implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraManager", lpparam.classLoader, "openCamera", String.class, Executor.class, CameraDevice.StateCallback.class, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    XposedBridge.log("【VCAM】openCamera (API >= P) called");
+                    Log.d("VCAM_DEBUG", "openCamera (API >= P) called");
                     if (param.args[2] == null) {
                         return;
                     }
@@ -199,6 +215,8 @@ public class HookMain implements IXposedHookLoadPackage {
                     File toast_control = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "no_toast.jpg");
                     need_to_show_toast = !toast_control.exists();
                     if (!file.exists()) {
+                        XposedBridge.log("【VCAM】virtual.mp4 does not exist at " + video_path);
+                        Log.d("VCAM_DEBUG", "virtual.mp4 does not exist at " + video_path);
                         if (toast_content != null && need_to_show_toast) {
                             try {
                                 Toast.makeText(toast_content, "不存在替换视频\n" + lpparam.packageName + "当前路径：" + video_path, Toast.LENGTH_SHORT).show();
@@ -359,10 +377,14 @@ public class HookMain implements IXposedHookLoadPackage {
         XposedHelpers.findAndHookMethod("android.hardware.Camera", lpparam.classLoader, "startPreview", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                XposedBridge.log("【VCAM】startPreview called");
+                Log.d("VCAM_DEBUG", "startPreview called");
                 File file = new File(video_path + "virtual.mp4");
                 File toast_control = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "no_toast.jpg");
                 need_to_show_toast = !toast_control.exists();
                 if (!file.exists()) {
+                    XposedBridge.log("【VCAM】virtual.mp4 does not exist at " + video_path);
+                    Log.d("VCAM_DEBUG", "virtual.mp4 does not exist at " + video_path);
                     if (toast_content != null && need_to_show_toast) {
                         try {
                             Toast.makeText(toast_content, "不存在替换视频\n" + lpparam.packageName + "当前路径：" + video_path, Toast.LENGTH_SHORT).show();
@@ -985,6 +1007,8 @@ public class HookMain implements IXposedHookLoadPackage {
                             }
                         }
                     });
+                    XposedBridge.log("【VCAM】video_path determined: " + video_path);
+                    Log.d("VCAM_DEBUG", "video_path determined: " + video_path);
                 }
             }
         });
