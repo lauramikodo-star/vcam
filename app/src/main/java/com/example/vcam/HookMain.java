@@ -88,8 +88,8 @@ public class HookMain implements IXposedHookLoadPackage {
     public static OutputConfiguration outputConfiguration;
     public boolean need_to_show_toast = true;
 
-    public int c2_ori_width = 1280;
-    public int c2_ori_height = 720;
+    public int c2_ori_width = 720;
+    public int c2_ori_height = 1280;
 
     public static Class c2_state_callback;
     public Context toast_content;
@@ -662,6 +662,8 @@ public class HookMain implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 XposedBridge.log("【VCAM】应用创建了渲染器：宽：" + param.args[0] + " 高：" + param.args[1] + "格式" + param.args[2]);
+                param.args[0] = c2_ori_width;
+                param.args[1] = c2_ori_height;
                 c2_ori_width = (int) param.args[0];
                 c2_ori_height = (int) param.args[1];
                 imageReaderFormat = (int) param.args[2];
