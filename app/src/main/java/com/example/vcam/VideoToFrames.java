@@ -110,12 +110,14 @@ public class VideoToFrames implements Runnable {
             String mime = mediaFormat.getString(MediaFormat.KEY_MIME);
             decoder = MediaCodec.createDecoderByType(mime);
             showSupportedColorFormat(decoder.getCodecInfo().getCapabilitiesForType(mime));
-            if (isColorFormatSupported(decodeColorFormat, decoder.getCodecInfo().getCapabilitiesForType(mime))) {
-                mediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, decodeColorFormat);
-                XposedBridge.log("【VCAM】【decoder】set decode color format to type " + decodeColorFormat);
-            } else {
-                Log.i(TAG, "unable to set decode color format, color format type " + decodeColorFormat + " not supported");
-                XposedBridge.log("【VCAM】【decoder】unable to set decode color format, color format type " + decodeColorFormat + " not supported");
+            if (play_surf == null) {
+                if (isColorFormatSupported(decodeColorFormat, decoder.getCodecInfo().getCapabilitiesForType(mime))) {
+                    mediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, decodeColorFormat);
+                    XposedBridge.log("【VCAM】【decoder】set decode color format to type " + decodeColorFormat);
+                } else {
+                    Log.i(TAG, "unable to set decode color format, color format type " + decodeColorFormat + " not supported");
+                    XposedBridge.log("【VCAM】【decoder】unable to set decode color format, color format type " + decodeColorFormat + " not supported");
+                }
             }
             decodeFramesToImage(decoder, extractor, mediaFormat);
             decoder.stop();
