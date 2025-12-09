@@ -118,6 +118,12 @@ public class VideoToFrames implements Runnable {
                     Log.i(TAG, "unable to set decode color format, color format type " + decodeColorFormat + " not supported");
                     XposedBridge.log("【VCAM】【decoder】unable to set decode color format, color format type " + decodeColorFormat + " not supported");
                 }
+            } else {
+                if (HookMain.c2_ori_width > 0 && HookMain.c2_ori_height > 0) {
+                    mediaFormat.setInteger(MediaFormat.KEY_WIDTH, HookMain.c2_ori_width);
+                    mediaFormat.setInteger(MediaFormat.KEY_HEIGHT, HookMain.c2_ori_height);
+                    XposedBridge.log("【VCAM】【decoder】Overriding decode resolution to " + HookMain.c2_ori_width + "x" + HookMain.c2_ori_height);
+                }
             }
             decodeFramesToImage(decoder, extractor, mediaFormat);
             decoder.stop();

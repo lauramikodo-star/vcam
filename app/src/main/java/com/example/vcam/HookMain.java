@@ -88,6 +88,8 @@ public class HookMain implements IXposedHookLoadPackage {
     public static OutputConfiguration outputConfiguration;
     public boolean need_to_show_toast = true;
 
+    public static int c2_ori_width = 1280;
+    public static int c2_ori_height = 720;
     public int c2_ori_width = 1080;
     public int c2_ori_height = 1920;
 
