@@ -102,6 +102,9 @@ public class HookMain implements IXposedHookLoadPackage {
     public static int c2_ori_height = 720;
 
     public static Class c2_state_callback;
+
+    public static volatile long stillCaptureStartTime = 0;
+    public static final long STILL_CAPTURE_TIMEOUT_MS = 2000;
     
     // Track ImageReader instances and their expected formats to handle format mismatches
     public static java.util.Map<ImageReader, Integer> imageReaderFormats = new java.util.concurrent.ConcurrentHashMap<>();
