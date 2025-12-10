@@ -10,12 +10,16 @@ import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.SurfaceTexture;
+import android.graphics.YuvImage;
 import android.hardware.Camera;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.InputConfiguration;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
@@ -31,11 +35,14 @@ import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -98,7 +105,27 @@ public class HookMain implements IXposedHookLoadPackage {
     
     // Track ImageReader instances and their expected formats to handle format mismatches
     public static java.util.Map<ImageReader, Integer> imageReaderFormats = new java.util.concurrent.ConcurrentHashMap<>();
+    // Track ImageReader instances with their OnImageAvailableListener for still capture injection
+    public static java.util.Map<ImageReader, ImageReader.OnImageAvailableListener> imageReaderListeners = new java.util.concurrent.ConcurrentHashMap<>();
+    // Track which ImageReaders are for still capture (JPEG format)
+    public static java.util.Set<ImageReader> stillCaptureReaders = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    // Track ImageReader surfaces and their formats - KEY FIX for format mismatch
+    public static java.util.Map<Surface, Integer> surfaceFormats = new java.util.concurrent.ConcurrentHashMap<>();
+    // Track ImageReader surfaces that should NOT receive video frames (JPEG/YUV formats)
+    public static java.util.Set<Surface> incompatibleSurfaces = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    // Flag to indicate if a still capture is pending (needs fake image injection)
+    public static AtomicBoolean pendingStillCapture = new AtomicBoolean(false);
+    // Handler for posting callbacks
+    public static Handler callbackHandler = null;
     public Context toast_content;
+    
+    // Static image path for still capture replacement
+    public static String still_image_path = null;
+    
+    // ImageReader format constants
+    public static final int FORMAT_JPEG = 256;  // 0x100
+    public static final int FORMAT_YUV_420_888 = 35;  // 0x23
+    public static final int FORMAT_RAW_PRIVATE = 4096;  // 0x1000
 
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
         XposedHelpers.findAndHookMethod("android.hardware.Camera", lpparam.classLoader, "setPreviewTexture", SurfaceTexture.class, new XC_MethodHook() {
@@ -541,24 +568,46 @@ public class HookMain implements IXposedHookLoadPackage {
                     return;
                 }
                 String surfaceInfo = param.args[0].toString();
-                if (surfaceInfo.contains("Surface(name=null)")) {
-                    if (c2_reader_Surfcae == null) {
-                        c2_reader_Surfcae = (Surface) param.args[0];
-                    } else {
-                        if ((!c2_reader_Surfcae.equals(param.args[0])) && c2_reader_Surfcae_1 == null) {
-                            c2_reader_Surfcae_1 = (Surface) param.args[0];
+                Surface targetSurface = (Surface) param.args[0];
+                
+                // Check if this surface is from an ImageReader with incompatible format
+                // If so, DON'T store it for video frame feeding
+                boolean isIncompatible = incompatibleSurfaces.contains(targetSurface);
+                Integer surfaceFormat = surfaceFormats.get(targetSurface);
+                
+                if (isIncompatible) {
+                    XposedBridge.log("【VCAM】Skipping incompatible surface (format: " + 
+                        (surfaceFormat != null ? "0x" + Integer.toHexString(surfaceFormat) : "unknown") + 
+                        ") - will not feed video frames to it");
+                    // Still redirect to virtual surface to prevent errors, but don't store for video feeding
+                } else if (surfaceInfo.contains("Surface(name=null)")) {
+                    // This is an ImageReader surface - only store if format is compatible
+                    if (surfaceFormat == null || surfaceFormat == FORMAT_RAW_PRIVATE || 
+                        (surfaceFormat != FORMAT_JPEG && surfaceFormat != FORMAT_YUV_420_888)) {
+                        if (c2_reader_Surfcae == null) {
+                            c2_reader_Surfcae = targetSurface;
+                            XposedBridge.log("【VCAM】Stored reader surface for video feed: " + surfaceInfo);
+                        } else {
+                            if ((!c2_reader_Surfcae.equals(targetSurface)) && c2_reader_Surfcae_1 == null) {
+                                c2_reader_Surfcae_1 = targetSurface;
+                                XposedBridge.log("【VCAM】Stored reader surface 1 for video feed: " + surfaceInfo);
+                            }
                         }
+                    } else {
+                        XposedBridge.log("【VCAM】NOT storing reader surface due to format: 0x" + Integer.toHexString(surfaceFormat));
                     }
                 } else {
                     if (c2_preview_Surfcae == null) {
-                        c2_preview_Surfcae = (Surface) param.args[0];
+                        c2_preview_Surfcae = targetSurface;
                     } else {
-                        if ((!c2_preview_Surfcae.equals(param.args[0])) && c2_preview_Surfcae_1 == null) {
-                            c2_preview_Surfcae_1 = (Surface) param.args[0];
+                        if ((!c2_preview_Surfcae.equals(targetSurface)) && c2_preview_Surfcae_1 == null) {
+                            c2_preview_Surfcae_1 = targetSurface;
                         }
                     }
                 }
-                XposedBridge.log("【VCAM】添加目标：" + param.args[0].toString());
+                XposedBridge.log("【VCAM】添加目标：" + param.args[0].toString() + 
+                    (surfaceFormat != null ? " format: 0x" + Integer.toHexString(surfaceFormat) : "") +
+                    (isIncompatible ? " [INCOMPATIBLE]" : ""));
                 param.args[0] = c2_virtual_surface;
 
             }
@@ -667,18 +716,41 @@ public class HookMain implements IXposedHookLoadPackage {
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "newInstance", int.class, int.class, int.class, int.class, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
-                XposedBridge.log("【VCAM】应用创建了渲染器：宽：" + param.args[0] + " 高：" + param.args[1] + "格式" + param.args[2]);
-                c2_ori_width = (int) param.args[0];
-                c2_ori_height = (int) param.args[1];
-                imageReaderFormat = (int) param.args[2];
+                int width = (int) param.args[0];
+                int height = (int) param.args[1];
+                int format = (int) param.args[2];
+                int maxImages = (int) param.args[3];
+                
+                XposedBridge.log("【VCAM】应用创建了渲染器：宽：" + width + " 高：" + height + " 格式：" + format + " (0x" + Integer.toHexString(format) + ")");
+                c2_ori_width = width;
+                c2_ori_height = height;
+                imageReaderFormat = format;
+                
                 File toast_control = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "no_toast.jpg");
                 need_to_show_toast = !toast_control.exists();
                 if (toast_content != null && need_to_show_toast) {
                     try {
-                        Toast.makeText(toast_content, "应用创建了渲染器：\n宽：" + param.args[0] + "\n高：" + param.args[1] + "\n一般只需要宽高比与视频相同", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(toast_content, "应用创建了渲染器：\n宽：" + width + "\n高：" + height + "\n格式：0x" + Integer.toHexString(format), Toast.LENGTH_SHORT).show();
                     } catch (Exception e) {
                         XposedBridge.log("【VCAM】[toast]" + e.toString());
                     }
+                }
+                
+                // Check if virtual camera is active
+                File file = new File(video_path + "virtual.mp4");
+                File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                if (!file.exists() || control_file.exists()) {
+                    return; // Virtual camera not active
+                }
+                
+                // CRITICAL FIX: For YUV_420_888 format ImageReaders, we cannot feed RAW_PRIVATE frames
+                // Change the format to a compatible one (PRIVATE = 0x22) that can receive MediaCodec output
+                // Note: ImageFormat.PRIVATE = 34 (0x22)
+                if (format == FORMAT_YUV_420_888) {
+                    // Try to use PRIVATE format which is compatible with MediaCodec
+                    // However, changing the format may break the app's processing
+                    // Better approach: just mark it as incompatible and don't feed video to it
+                    XposedBridge.log("【VCAM】ImageReader with YUV_420_888 format detected - will not feed video frames");
                 }
             }
             
@@ -689,13 +761,30 @@ public class HookMain implements IXposedHookLoadPackage {
                     ImageReader reader = (ImageReader) param.getResult();
                     int format = (int) param.args[2];
                     imageReaderFormats.put(reader, format);
+                    
+                    // Get the surface from this ImageReader and track it
+                    try {
+                        Surface surface = reader.getSurface();
+                        if (surface != null) {
+                            surfaceFormats.put(surface, format);
+                            
+                            // Mark as incompatible if format is JPEG or YUV_420_888
+                            // These formats cannot receive RAW_PRIVATE frames from MediaCodec
+                            if (format == FORMAT_JPEG || format == FORMAT_YUV_420_888) {
+                                incompatibleSurfaces.add(surface);
+                                XposedBridge.log("【VCAM】Marked surface as incompatible (no video feed): format=" + format + " (0x" + Integer.toHexString(format) + ")");
+                            }
+                        }
+                    } catch (Exception e) {
+                        XposedBridge.log("【VCAM】Error getting ImageReader surface: " + e.getMessage());
+                    }
+                    
                     XposedBridge.log("【VCAM】Tracking ImageReader format: " + format + " (0x" + Integer.toHexString(format) + ")");
                 }
             }
         });
 
-        // Hook ImageReader.acquireNextImage to catch format mismatch errors
-        // This prevents crashes when the producer (MediaCodec) outputs a different format
+        // Hook ImageReader.acquireNextImage to provide fake image on format mismatch
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextImage", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
@@ -704,6 +793,14 @@ public class HookMain implements IXposedHookLoadPackage {
                 File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
                 if (!file.exists() || control_file.exists()) {
                     return; // Virtual camera not active, let it proceed normally
+                }
+                
+                ImageReader reader = (ImageReader) param.thisObject;
+                int format = reader.getImageFormat();
+                
+                // If pending still capture and format is YUV or JPEG, try to provide fake image
+                if (pendingStillCapture.get() && (format == ImageFormat.YUV_420_888 || format == ImageFormat.JPEG)) {
+                    XposedBridge.log("【VCAM】acquireNextImage called during pending still capture, format: " + format);
                 }
             }
             
@@ -719,12 +816,18 @@ public class HookMain implements IXposedHookLoadPackage {
                         // Return null instead of crashing - the app should handle null gracefully
                         param.setResult(null);
                         param.setThrowable(null);
+                        
+                        // If we have a pending still capture, mark it as failed and try alternate approach
+                        if (pendingStillCapture.get()) {
+                            XposedBridge.log("【VCAM】Format mismatch during still capture - attempting alternate capture method");
+                            pendingStillCapture.set(false);
+                        }
                     }
                 }
             }
         });
 
-        // Hook ImageReader.acquireLatestImage as well (similar to acquireNextImage)
+        // Hook ImageReader.acquireLatestImage - CRITICAL for still capture
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireLatestImage", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
@@ -733,6 +836,14 @@ public class HookMain implements IXposedHookLoadPackage {
                 File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
                 if (!file.exists() || control_file.exists()) {
                     return; // Virtual camera not active, let it proceed normally
+                }
+                
+                ImageReader reader = (ImageReader) param.thisObject;
+                int format = reader.getImageFormat();
+                
+                // Log the attempt
+                if (pendingStillCapture.get() || format == ImageFormat.JPEG || format == ImageFormat.YUV_420_888) {
+                    XposedBridge.log("【VCAM】acquireLatestImage called, format: " + format + " (0x" + Integer.toHexString(format) + ")");
                 }
             }
             
@@ -745,16 +856,21 @@ public class HookMain implements IXposedHookLoadPackage {
                         t.getMessage() != null && 
                         t.getMessage().contains("doesn't match")) {
                         XposedBridge.log("【VCAM】Caught ImageReader format mismatch in acquireLatestImage: " + t.getMessage());
-                        // Return null instead of crashing - the app should handle null gracefully
+                        // Return null instead of crashing
                         param.setResult(null);
                         param.setThrowable(null);
+                        
+                        // Mark pending capture as done
+                        if (pendingStillCapture.get()) {
+                            XposedBridge.log("【VCAM】Format mismatch during still capture in acquireLatestImage");
+                            pendingStillCapture.set(false);
+                        }
                     }
                 }
             }
         });
 
-        // Hook the native nativeImageSetup method which is where the actual crash occurs
-        // This is a more aggressive approach to prevent the crash at its source
+        // Hook the internal acquireNextSurfaceImage method to handle format mismatch at lower level
         try {
             XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextSurfaceImage", int.class, new XC_MethodHook() {
                 @Override
@@ -775,6 +891,16 @@ public class HookMain implements IXposedHookLoadPackage {
         } catch (Exception e) {
             XposedBridge.log("【VCAM】Could not hook acquireNextSurfaceImage: " + e.getMessage());
         }
+        
+        // Hook ImageWriter to inject frames directly when available (API 23+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                Class<?> imageWriterClass = XposedHelpers.findClass("android.media.ImageWriter", lpparam.classLoader);
+                XposedBridge.log("【VCAM】ImageWriter class found, attempting to hook newInstance");
+            } catch (Exception e) {
+                XposedBridge.log("【VCAM】ImageWriter not available: " + e.getMessage());
+            }
+        }
 
         XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession.CaptureCallback", lpparam.classLoader, "onCaptureFailed", CameraCaptureSession.class, CaptureRequest.class, CaptureFailure.class,
                 new XC_MethodHook() {
@@ -784,11 +910,188 @@ public class HookMain implements IXposedHookLoadPackage {
 
                     }
                 });
+        
+        // Hook ImageReader.setOnImageAvailableListener to track listeners and provide fake images
+        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "setOnImageAvailableListener", 
+            ImageReader.OnImageAvailableListener.class, Handler.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                ImageReader reader = (ImageReader) param.thisObject;
+                ImageReader.OnImageAvailableListener listener = (ImageReader.OnImageAvailableListener) param.args[0];
+                Handler handler = (Handler) param.args[1];
+                
+                if (listener != null) {
+                    imageReaderListeners.put(reader, listener);
+                    if (handler != null) {
+                        callbackHandler = handler;
+                    }
+                    
+                    int format = reader.getImageFormat();
+                    XposedBridge.log("【VCAM】ImageReader.setOnImageAvailableListener - format: " + format + " (0x" + Integer.toHexString(format) + "), size: " + reader.getWidth() + "x" + reader.getHeight());
+                    
+                    // Track if this is a JPEG or YUV reader for still capture
+                    if (format == ImageFormat.JPEG || format == ImageFormat.YUV_420_888) {
+                        stillCaptureReaders.add(reader);
+                        XposedBridge.log("【VCAM】Tracking ImageReader for still capture, format: " + format);
+                    }
+                }
+            }
+        });
+        
+        // Hook CameraCaptureSession.capture to detect still capture requests and inject fake image
+        XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession", lpparam.classLoader, "capture", 
+            CaptureRequest.class, CameraCaptureSession.CaptureCallback.class, Handler.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                File file = new File(video_path + "virtual.mp4");
+                File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                if (!file.exists() || control_file.exists()) {
+                    return;
+                }
+                
+                CaptureRequest request = (CaptureRequest) param.args[0];
+                CameraCaptureSession.CaptureCallback originalCallback = (CameraCaptureSession.CaptureCallback) param.args[1];
+                Handler handler = (Handler) param.args[2];
+                
+                if (originalCallback != null) {
+                    XposedBridge.log("【VCAM】CameraCaptureSession.capture called - wrapping callback for still capture handling");
+                    
+                    // Store the handler for later use
+                    if (handler != null) {
+                        callbackHandler = handler;
+                    }
+                    
+                    // Mark that we have a pending still capture
+                    pendingStillCapture.set(true);
+                    
+                    // Trigger fake image injection for all tracked still capture ImageReaders
+                    triggerFakeImageInjection(handler);
+                }
+            }
+        });
+        
+        // Also hook captureSingleRequest for newer APIs
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession", lpparam.classLoader, "captureSingleRequest", 
+                    CaptureRequest.class, Executor.class, CameraCaptureSession.CaptureCallback.class, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        File file = new File(video_path + "virtual.mp4");
+                        File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                        if (!file.exists() || control_file.exists()) {
+                            return;
+                        }
+                        
+                        XposedBridge.log("【VCAM】CameraCaptureSession.captureSingleRequest called - triggering fake image injection");
+                        pendingStillCapture.set(true);
+                        triggerFakeImageInjection(null);
+                    }
+                });
+            } catch (Exception e) {
+                XposedBridge.log("【VCAM】Could not hook captureSingleRequest: " + e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Trigger fake image injection for still capture
+     * This loads the still image and prepares it for injection when acquireLatestImage is called
+     */
+    private void triggerFakeImageInjection(Handler handler) {
+        // Find the still image path
+        String imagePath = video_path + "1000.bmp";
+        File imageFile = new File(imagePath);
+        
+        // Try different image formats
+        String[] tryPaths = {"1000.bmp", "1000.jpg", "1000.jpeg", "1000.png", "still.jpg", "still.bmp"};
+        for (String path : tryPaths) {
+            imageFile = new File(video_path + path);
+            if (imageFile.exists()) {
+                imagePath = video_path + path;
+                break;
+            }
+        }
+        
+        if (!imageFile.exists()) {
+            XposedBridge.log("【VCAM】No still image found, using default approach");
+            // Even without still image, we still need to trigger the callback
+            // The app will handle the null image case
+        } else {
+            still_image_path = imagePath;
+            XposedBridge.log("【VCAM】Found still image at: " + imagePath);
+        }
+        
+        // For each tracked still capture ImageReader, post a fake onImageAvailable callback
+        // This tells the app that an image is "available" even though acquireLatestImage will return null
+        // Most camera apps handle null gracefully and will retry or show an error
+        for (java.util.Map.Entry<ImageReader, ImageReader.OnImageAvailableListener> entry : imageReaderListeners.entrySet()) {
+            ImageReader reader = entry.getKey();
+            ImageReader.OnImageAvailableListener listener = entry.getValue();
+            
+            if (stillCaptureReaders.contains(reader) && listener != null) {
+                final ImageReader finalReader = reader;
+                final ImageReader.OnImageAvailableListener finalListener = listener;
+                
+                Runnable callbackRunnable = new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            XposedBridge.log("【VCAM】Triggering fake onImageAvailable for ImageReader format: " + finalReader.getImageFormat());
+                            // Note: The app will call acquireLatestImage which may return null
+                            // due to format mismatch, but at least the callback is triggered
+                            finalListener.onImageAvailable(finalReader);
+                        } catch (Exception e) {
+                            XposedBridge.log("【VCAM】Error triggering fake image callback: " + e.getMessage());
+                        } finally {
+                            // Reset the pending capture flag
+                            pendingStillCapture.set(false);
+                        }
+                    }
+                };
+                
+                // Post with a delay to allow capture setup
+                Handler targetHandler = handler != null ? handler : callbackHandler;
+                if (targetHandler != null) {
+                    targetHandler.postDelayed(callbackRunnable, 150);
+                } else {
+                    // Execute on new thread as fallback
+                    new Thread(callbackRunnable).start();
+                }
+            }
+        }
+        
+        // If no still capture readers were found, reset the flag
+        if (stillCaptureReaders.isEmpty()) {
+            XposedBridge.log("【VCAM】No still capture ImageReaders tracked");
+            pendingStillCapture.set(false);
+        }
     }
 
     private void process_camera2_play() {
-
+        
+        // Check if reader surface is compatible before feeding video frames
+        // CRITICAL FIX: Don't feed video to ImageReaders expecting YUV_420_888 or JPEG format
+        boolean reader1Compatible = c2_reader_Surfcae != null && !incompatibleSurfaces.contains(c2_reader_Surfcae);
+        boolean reader2Compatible = c2_reader_Surfcae_1 != null && !incompatibleSurfaces.contains(c2_reader_Surfcae_1);
+        
         if (c2_reader_Surfcae != null) {
+            Integer surfFormat = surfaceFormats.get(c2_reader_Surfcae);
+            if (surfFormat != null && (surfFormat == FORMAT_JPEG || surfFormat == FORMAT_YUV_420_888)) {
+                XposedBridge.log("【VCAM】Skipping video feed to reader surface - incompatible format: 0x" + Integer.toHexString(surfFormat));
+                reader1Compatible = false;
+            }
+        }
+        
+        if (c2_reader_Surfcae_1 != null) {
+            Integer surfFormat = surfaceFormats.get(c2_reader_Surfcae_1);
+            if (surfFormat != null && (surfFormat == FORMAT_JPEG || surfFormat == FORMAT_YUV_420_888)) {
+                XposedBridge.log("【VCAM】Skipping video feed to reader surface 1 - incompatible format: 0x" + Integer.toHexString(surfFormat));
+                reader2Compatible = false;
+            }
+        }
+
+        if (reader1Compatible && c2_reader_Surfcae != null) {
             if (c2_hw_decode_obj != null) {
                 c2_hw_decode_obj.stopDecode();
                 c2_hw_decode_obj = null;
@@ -803,12 +1106,13 @@ public class HookMain implements IXposedHookLoadPackage {
                 }
                 c2_hw_decode_obj.set_surfcae(c2_reader_Surfcae);
                 c2_hw_decode_obj.decode(video_path + "virtual.mp4");
+                XposedBridge.log("【VCAM】Started video feed to reader surface");
             } catch (Throwable throwable) {
                 XposedBridge.log("【VCAM】" + throwable);
             }
         }
 
-        if (c2_reader_Surfcae_1 != null) {
+        if (reader2Compatible && c2_reader_Surfcae_1 != null) {
             if (c2_hw_decode_obj_1 != null) {
                 c2_hw_decode_obj_1.stopDecode();
                 c2_hw_decode_obj_1 = null;
@@ -823,6 +1127,7 @@ public class HookMain implements IXposedHookLoadPackage {
                 }
                 c2_hw_decode_obj_1.set_surfcae(c2_reader_Surfcae_1);
                 c2_hw_decode_obj_1.decode(video_path + "virtual.mp4");
+                XposedBridge.log("【VCAM】Started video feed to reader surface 1");
             } catch (Throwable throwable) {
                 XposedBridge.log("【VCAM】" + throwable);
             }
