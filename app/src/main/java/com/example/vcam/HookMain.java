@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
 import android.hardware.camera2.CameraCaptureSession;
@@ -18,6 +19,8 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.InputConfiguration;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
+import android.media.Image;
+import android.media.ImageReader;
 import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Environment;
@@ -90,10 +93,11 @@ public class HookMain implements IXposedHookLoadPackage {
 
     public static int c2_ori_width = 1280;
     public static int c2_ori_height = 720;
-    public int c2_ori_width = 1080;
-    public int c2_ori_height = 1920;
 
     public static Class c2_state_callback;
+    
+    // Track ImageReader instances and their expected formats to handle format mismatches
+    public static java.util.Map<ImageReader, Integer> imageReaderFormats = new java.util.concurrent.ConcurrentHashMap<>();
     public Context toast_content;
 
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Exception {
@@ -677,8 +681,100 @@ public class HookMain implements IXposedHookLoadPackage {
                     }
                 }
             }
+            
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                // Track the ImageReader and its configured format for later use
+                if (param.getResult() != null) {
+                    ImageReader reader = (ImageReader) param.getResult();
+                    int format = (int) param.args[2];
+                    imageReaderFormats.put(reader, format);
+                    XposedBridge.log("【VCAM】Tracking ImageReader format: " + format + " (0x" + Integer.toHexString(format) + ")");
+                }
+            }
         });
 
+        // Hook ImageReader.acquireNextImage to catch format mismatch errors
+        // This prevents crashes when the producer (MediaCodec) outputs a different format
+        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextImage", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                // Check if virtual camera is active
+                File file = new File(video_path + "virtual.mp4");
+                File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                if (!file.exists() || control_file.exists()) {
+                    return; // Virtual camera not active, let it proceed normally
+                }
+            }
+            
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                // If an exception was thrown, we catch it here
+                if (param.getThrowable() != null) {
+                    Throwable t = param.getThrowable();
+                    if (t instanceof UnsupportedOperationException && 
+                        t.getMessage() != null && 
+                        t.getMessage().contains("doesn't match")) {
+                        XposedBridge.log("【VCAM】Caught ImageReader format mismatch: " + t.getMessage());
+                        // Return null instead of crashing - the app should handle null gracefully
+                        param.setResult(null);
+                        param.setThrowable(null);
+                    }
+                }
+            }
+        });
+
+        // Hook ImageReader.acquireLatestImage as well (similar to acquireNextImage)
+        XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireLatestImage", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                // Check if virtual camera is active
+                File file = new File(video_path + "virtual.mp4");
+                File control_file = new File(Environment.getExternalStorageDirectory().getPath() + "/DCIM/Camera1/" + "disable.jpg");
+                if (!file.exists() || control_file.exists()) {
+                    return; // Virtual camera not active, let it proceed normally
+                }
+            }
+            
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                // If an exception was thrown, we catch it here
+                if (param.getThrowable() != null) {
+                    Throwable t = param.getThrowable();
+                    if (t instanceof UnsupportedOperationException && 
+                        t.getMessage() != null && 
+                        t.getMessage().contains("doesn't match")) {
+                        XposedBridge.log("【VCAM】Caught ImageReader format mismatch in acquireLatestImage: " + t.getMessage());
+                        // Return null instead of crashing - the app should handle null gracefully
+                        param.setResult(null);
+                        param.setThrowable(null);
+                    }
+                }
+            }
+        });
+
+        // Hook the native nativeImageSetup method which is where the actual crash occurs
+        // This is a more aggressive approach to prevent the crash at its source
+        try {
+            XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextSurfaceImage", int.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (param.getThrowable() != null) {
+                        Throwable t = param.getThrowable();
+                        if (t instanceof UnsupportedOperationException && 
+                            t.getMessage() != null && 
+                            t.getMessage().contains("doesn't match")) {
+                            XposedBridge.log("【VCAM】Caught format mismatch in acquireNextSurfaceImage: " + t.getMessage());
+                            // Return error code instead of throwing
+                            param.setResult(-1);
+                            param.setThrowable(null);
+                        }
+                    }
+                }
+            });
+        } catch (Exception e) {
+            XposedBridge.log("【VCAM】Could not hook acquireNextSurfaceImage: " + e.getMessage());
+        }
 
         XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession.CaptureCallback", lpparam.classLoader, "onCaptureFailed", CameraCaptureSession.class, CaptureRequest.class, CaptureFailure.class,
                 new XC_MethodHook() {
