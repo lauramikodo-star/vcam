@@ -1103,6 +1103,7 @@ public class HookMain implements IXposedHookLoadPackage {
                         
                         XposedBridge.log("【VCAM】CameraCaptureSession.captureSingleRequest called - triggering fake image injection");
                         pendingStillCapture.set(true);
+                        stillCaptureStartTime = System.currentTimeMillis();
                         triggerFakeImageInjection(null);
                     }
                 });
@@ -1126,7 +1127,12 @@ public class HookMain implements IXposedHookLoadPackage {
             if (stillCaptureReaders.contains(reader) && listener != null) {
                 try {
                     XposedBridge.log("【VCAM】Triggering onImageAvailable for format: " + reader.getImageFormat());
-                    listener.onImageAvailable(reader);
+                    // Only trigger if we haven't timed out
+                    if (stillCaptureStartTime == 0 || (System.currentTimeMillis() - stillCaptureStartTime) < STILL_CAPTURE_TIMEOUT_MS * 2) {
+                        listener.onImageAvailable(reader);
+                    } else {
+                        XposedBridge.log("【VCAM】Skipping callback - capture already timed out");
+                    }
                 } catch (Exception e) {
                     XposedBridge.log("【VCAM】Error triggering callback: " + e.getMessage());
                 }
@@ -1135,6 +1141,7 @@ public class HookMain implements IXposedHookLoadPackage {
         
         // Reset the pending capture flag
         pendingStillCapture.set(false);
+        stillCaptureStartTime = 0;
     }
     
     /**
@@ -1162,6 +1169,7 @@ public class HookMain implements IXposedHookLoadPackage {
             // Even without still image, we need to complete the capture flow
             // Mark capture as done so app doesn't hang
             pendingStillCapture.set(false);
+            stillCaptureStartTime = 0;
         } else {
             still_image_path = imagePath;
             XposedBridge.log("【VCAM】Found still image at: " + imagePath);
@@ -1204,6 +1212,7 @@ public class HookMain implements IXposedHookLoadPackage {
                         } finally {
                             // Reset the pending capture flag
                             pendingStillCapture.set(false);
+                            stillCaptureStartTime = 0;
                         }
                     }
                 };
@@ -1226,6 +1235,7 @@ public class HookMain implements IXposedHookLoadPackage {
         if (stillCaptureReaders.isEmpty()) {
             XposedBridge.log("【VCAM】No still capture ImageReaders tracked - capture may hang");
             pendingStillCapture.set(false);
+            stillCaptureStartTime = 0;
         }
     }
 
@@ -1265,6 +1275,8 @@ public class HookMain implements IXposedHookLoadPackage {
                 } else {
                     c2_hw_decode_obj.setSaveFrames("null", OutputImageFormat.NV21);
                 }
+                // Use original video resolution for better scaling - let the surface handle the scaling
+                c2_hw_decode_obj.setUseOriginalResolution(true);
                 c2_hw_decode_obj.set_surfcae(c2_reader_Surfcae);
                 c2_hw_decode_obj.decode(video_path + "virtual.mp4");
                 XposedBridge.log("【VCAM】Started video feed to reader surface");
@@ -1286,6 +1298,8 @@ public class HookMain implements IXposedHookLoadPackage {
                 } else {
                     c2_hw_decode_obj_1.setSaveFrames("null", OutputImageFormat.NV21);
                 }
+                // Use original video resolution for better scaling
+                c2_hw_decode_obj_1.setUseOriginalResolution(true);
                 c2_hw_decode_obj_1.set_surfcae(c2_reader_Surfcae_1);
                 c2_hw_decode_obj_1.decode(video_path + "virtual.mp4");
                 XposedBridge.log("【VCAM】Started video feed to reader surface 1");
