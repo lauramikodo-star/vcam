@@ -871,25 +871,44 @@ public class HookMain implements IXposedHookLoadPackage {
         });
 
         // Hook the internal acquireNextSurfaceImage method to handle format mismatch at lower level
+        // Note: This method is private and takes a SurfaceImage (inner class) parameter
+        // The method signature varies across Android versions, so we need to handle this carefully
+        // CRITICAL: We must catch Throwable (not just Exception) because NoSuchMethodError is an Error
         try {
-            XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextSurfaceImage", int.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (param.getThrowable() != null) {
-                        Throwable t = param.getThrowable();
-                        if (t instanceof UnsupportedOperationException && 
-                            t.getMessage() != null && 
-                            t.getMessage().contains("doesn't match")) {
-                            XposedBridge.log("【VCAM】Caught format mismatch in acquireNextSurfaceImage: " + t.getMessage());
-                            // Return error code instead of throwing
-                            param.setResult(-1);
-                            param.setThrowable(null);
+            // Try to find the SurfaceImage inner class first
+            Class<?> surfaceImageClass = null;
+            try {
+                surfaceImageClass = XposedHelpers.findClass("android.media.ImageReader$SurfaceImage", lpparam.classLoader);
+            } catch (Throwable classEx) {
+                XposedBridge.log("【VCAM】SurfaceImage class not found, skipping acquireNextSurfaceImage hook: " + classEx.getMessage());
+            }
+            
+            if (surfaceImageClass != null) {
+                final Class<?> finalSurfaceImageClass = surfaceImageClass;
+                XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireNextSurfaceImage", finalSurfaceImageClass, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (param.getThrowable() != null) {
+                            Throwable t = param.getThrowable();
+                            if (t instanceof UnsupportedOperationException && 
+                                t.getMessage() != null && 
+                                t.getMessage().contains("doesn't match")) {
+                                XposedBridge.log("【VCAM】Caught format mismatch in acquireNextSurfaceImage: " + t.getMessage());
+                                // Return ACQUIRE_NO_BUFS (1) instead of throwing - this signals no buffer available
+                                // which is a safe error code that apps handle gracefully
+                                param.setResult(1);
+                                param.setThrowable(null);
+                            }
                         }
                     }
-                }
-            });
-        } catch (Exception e) {
-            XposedBridge.log("【VCAM】Could not hook acquireNextSurfaceImage: " + e.getMessage());
+                });
+                XposedBridge.log("【VCAM】Successfully hooked acquireNextSurfaceImage");
+            }
+        } catch (Throwable t) {
+            // Catch all errors including NoSuchMethodError, ClassNotFoundError, etc.
+            // Method signature doesn't match on this Android version - this is expected on some devices
+            // Log and continue - don't crash the module initialization
+            XposedBridge.log("【VCAM】Could not hook acquireNextSurfaceImage (expected on some Android versions): " + t.getClass().getSimpleName() + " - " + t.getMessage());
         }
         
         // Hook ImageWriter to inject frames directly when available (API 23+)
