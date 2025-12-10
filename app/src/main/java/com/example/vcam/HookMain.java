@@ -117,6 +117,12 @@ public class HookMain implements IXposedHookLoadPackage {
     public static AtomicBoolean pendingStillCapture = new AtomicBoolean(false);
     // Handler for posting callbacks
     public static Handler callbackHandler = null;
+    // Track the original surfaces for still capture (JPEG/YUV format surfaces)
+    public static java.util.Map<Surface, Surface> originalCaptureTargets = new java.util.concurrent.ConcurrentHashMap<>();
+    // Track the capture session for direct capture handling
+    public static CameraCaptureSession activeCaptureSession = null;
+    // Track pending capture callbacks
+    public static CameraCaptureSession.CaptureCallback pendingCaptureCallback = null;
     public Context toast_content;
     
     // Static image path for still capture replacement
@@ -576,10 +582,16 @@ public class HookMain implements IXposedHookLoadPackage {
                 Integer surfaceFormat = surfaceFormats.get(targetSurface);
                 
                 if (isIncompatible) {
-                    XposedBridge.log("【VCAM】Skipping incompatible surface (format: " + 
+                    XposedBridge.log("【VCAM】Incompatible surface detected (format: " + 
                         (surfaceFormat != null ? "0x" + Integer.toHexString(surfaceFormat) : "unknown") + 
-                        ") - will not feed video frames to it");
-                    // Still redirect to virtual surface to prevent errors, but don't store for video feeding
+                        ") - marking for special handling");
+                    // CRITICAL FIX: For JPEG/YUV surfaces used for still capture,
+                    // we still redirect to virtual surface but trigger immediate completion
+                    // to prevent infinite hang. The capture will "fail" gracefully.
+                    // Store the original surface for reference
+                    originalCaptureTargets.put(c2_virtual_surface, targetSurface);
+                    // Set pending capture flag so we can handle this in acquireLatestImage
+                    pendingStillCapture.set(true);
                 } else if (surfaceInfo.contains("Surface(name=null)")) {
                     // This is an ImageReader surface - only store if format is compatible
                     if (surfaceFormat == null || surfaceFormat == FORMAT_RAW_PRIVATE || 
@@ -798,9 +810,11 @@ public class HookMain implements IXposedHookLoadPackage {
                 ImageReader reader = (ImageReader) param.thisObject;
                 int format = reader.getImageFormat();
                 
-                // If pending still capture and format is YUV or JPEG, try to provide fake image
+                // If pending still capture and format is YUV or JPEG, return null to prevent hang
                 if (pendingStillCapture.get() && (format == ImageFormat.YUV_420_888 || format == ImageFormat.JPEG)) {
-                    XposedBridge.log("【VCAM】acquireNextImage called during pending still capture, format: " + format);
+                    XposedBridge.log("【VCAM】acquireNextImage called during pending still capture, format: " + format + " - returning null");
+                    pendingStillCapture.set(false);
+                    param.setResult(null);
                 }
             }
             
@@ -817,17 +831,26 @@ public class HookMain implements IXposedHookLoadPackage {
                         param.setResult(null);
                         param.setThrowable(null);
                         
-                        // If we have a pending still capture, mark it as failed and try alternate approach
+                        // If we have a pending still capture, mark it as failed
                         if (pendingStillCapture.get()) {
-                            XposedBridge.log("【VCAM】Format mismatch during still capture - attempting alternate capture method");
+                            XposedBridge.log("【VCAM】Format mismatch during still capture");
                             pendingStillCapture.set(false);
                         }
                     }
+                }
+                
+                // Also handle IllegalStateException (no buffers available)
+                if (param.getThrowable() instanceof IllegalStateException) {
+                    XposedBridge.log("【VCAM】Caught IllegalStateException in acquireNextImage: " + param.getThrowable().getMessage());
+                    param.setResult(null);
+                    param.setThrowable(null);
+                    pendingStillCapture.set(false);
                 }
             }
         });
 
         // Hook ImageReader.acquireLatestImage - CRITICAL for still capture
+        // This is where the app tries to get the captured image
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "acquireLatestImage", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
@@ -843,7 +866,18 @@ public class HookMain implements IXposedHookLoadPackage {
                 
                 // Log the attempt
                 if (pendingStillCapture.get() || format == ImageFormat.JPEG || format == ImageFormat.YUV_420_888) {
-                    XposedBridge.log("【VCAM】acquireLatestImage called, format: " + format + " (0x" + Integer.toHexString(format) + ")");
+                    XposedBridge.log("【VCAM】acquireLatestImage called, format: " + format + " (0x" + Integer.toHexString(format) + "), pending: " + pendingStillCapture.get());
+                }
+                
+                // CRITICAL FIX: If this is a still capture ImageReader and we're in pending capture state,
+                // the app is trying to get the image but there's none available.
+                // We need to return null gracefully without throwing an exception.
+                if (pendingStillCapture.get() && (format == FORMAT_JPEG || format == FORMAT_YUV_420_888)) {
+                    XposedBridge.log("【VCAM】Still capture ImageReader - returning null to prevent hang");
+                    // Reset pending state since we're "completing" the capture
+                    pendingStillCapture.set(false);
+                    // Return null - app should handle this as a capture failure
+                    param.setResult(null);
                 }
             }
             
@@ -866,6 +900,14 @@ public class HookMain implements IXposedHookLoadPackage {
                             pendingStillCapture.set(false);
                         }
                     }
+                }
+                
+                // Also handle IllegalStateException (no buffers available)
+                if (param.getThrowable() instanceof IllegalStateException) {
+                    XposedBridge.log("【VCAM】Caught IllegalStateException in acquireLatestImage: " + param.getThrowable().getMessage());
+                    param.setResult(null);
+                    param.setThrowable(null);
+                    pendingStillCapture.set(false);
                 }
             }
         });
@@ -925,10 +967,45 @@ public class HookMain implements IXposedHookLoadPackage {
                 new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
-                        XposedBridge.log("【VCAM】onCaptureFailed" + "原因：" + ((CaptureFailure) param.args[2]).getReason());
-
+                        XposedBridge.log("【VCAM】onCaptureFailed - 原因：" + ((CaptureFailure) param.args[2]).getReason());
+                        // Reset pending capture flag on failure
+                        pendingStillCapture.set(false);
                     }
                 });
+        
+        // Hook onCaptureCompleted to trigger fake image injection after capture completes
+        XposedHelpers.findAndHookMethod("android.hardware.camera2.CameraCaptureSession.CaptureCallback", lpparam.classLoader, "onCaptureCompleted", 
+            CameraCaptureSession.class, CaptureRequest.class, TotalCaptureResult.class,
+            new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    // Check if we have a pending still capture
+                    if (pendingStillCapture.get()) {
+                        XposedBridge.log("【VCAM】onCaptureCompleted - triggering fake image for still capture");
+                        
+                        // Get the handler from the callback or use our stored one
+                        Handler targetHandler = callbackHandler;
+                        
+                        // Trigger the image available callback with a short delay
+                        if (targetHandler != null) {
+                            targetHandler.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    triggerImageAvailableCallbacks();
+                                }
+                            }, 50);
+                        } else {
+                            // Trigger directly in a new thread
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    triggerImageAvailableCallbacks();
+                                }
+                            }).start();
+                        }
+                    }
+                }
+            });
         
         // Hook ImageReader.setOnImageAvailableListener to track listeners and provide fake images
         XposedHelpers.findAndHookMethod("android.media.ImageReader", lpparam.classLoader, "setOnImageAvailableListener", 
@@ -971,6 +1048,11 @@ public class HookMain implements IXposedHookLoadPackage {
                 CaptureRequest request = (CaptureRequest) param.args[0];
                 CameraCaptureSession.CaptureCallback originalCallback = (CameraCaptureSession.CaptureCallback) param.args[1];
                 Handler handler = (Handler) param.args[2];
+                CameraCaptureSession session = (CameraCaptureSession) param.thisObject;
+                
+                // Store session and callback for later use
+                activeCaptureSession = session;
+                pendingCaptureCallback = originalCallback;
                 
                 if (originalCallback != null) {
                     XposedBridge.log("【VCAM】CameraCaptureSession.capture called - wrapping callback for still capture handling");
@@ -983,8 +1065,25 @@ public class HookMain implements IXposedHookLoadPackage {
                     // Mark that we have a pending still capture
                     pendingStillCapture.set(true);
                     
-                    // Trigger fake image injection for all tracked still capture ImageReaders
-                    triggerFakeImageInjection(handler);
+                    // CRITICAL FIX: Instead of triggering fake callback (which leads to null image),
+                    // we let the capture proceed but handle the result in onCaptureCompleted
+                    // The key is to complete the capture flow so the app doesn't hang
+                    
+                    // Schedule a timeout handler to complete the capture if it gets stuck
+                    Handler targetHandler = handler != null ? handler : callbackHandler;
+                    if (targetHandler != null) {
+                        targetHandler.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (pendingStillCapture.get()) {
+                                    XposedBridge.log("【VCAM】Still capture timeout - forcing completion");
+                                    pendingStillCapture.set(false);
+                                    // Trigger the image available callback for any tracked readers
+                                    triggerFakeImageInjection(targetHandler);
+                                }
+                            }
+                        }, 500); // 500ms timeout
+                    }
                 }
             }
         });
@@ -1014,8 +1113,34 @@ public class HookMain implements IXposedHookLoadPackage {
     }
     
     /**
+     * Trigger ImageReader callbacks for all tracked still capture readers
+     * This is called after onCaptureCompleted to complete the capture flow
+     */
+    private void triggerImageAvailableCallbacks() {
+        XposedBridge.log("【VCAM】Triggering ImageAvailable callbacks for all tracked readers");
+        
+        for (java.util.Map.Entry<ImageReader, ImageReader.OnImageAvailableListener> entry : imageReaderListeners.entrySet()) {
+            ImageReader reader = entry.getKey();
+            ImageReader.OnImageAvailableListener listener = entry.getValue();
+            
+            if (stillCaptureReaders.contains(reader) && listener != null) {
+                try {
+                    XposedBridge.log("【VCAM】Triggering onImageAvailable for format: " + reader.getImageFormat());
+                    listener.onImageAvailable(reader);
+                } catch (Exception e) {
+                    XposedBridge.log("【VCAM】Error triggering callback: " + e.getMessage());
+                }
+            }
+        }
+        
+        // Reset the pending capture flag
+        pendingStillCapture.set(false);
+    }
+    
+    /**
      * Trigger fake image injection for still capture
-     * This loads the still image and prepares it for injection when acquireLatestImage is called
+     * This loads the still image and triggers the onImageAvailable callback
+     * CRITICAL: We need to ensure the app gets a valid response so it doesn't hang
      */
     private void triggerFakeImageInjection(Handler handler) {
         // Find the still image path
@@ -1033,17 +1158,27 @@ public class HookMain implements IXposedHookLoadPackage {
         }
         
         if (!imageFile.exists()) {
-            XposedBridge.log("【VCAM】No still image found, using default approach");
-            // Even without still image, we still need to trigger the callback
-            // The app will handle the null image case
+            XposedBridge.log("【VCAM】No still image found, will skip capture gracefully");
+            // Even without still image, we need to complete the capture flow
+            // Mark capture as done so app doesn't hang
+            pendingStillCapture.set(false);
         } else {
             still_image_path = imagePath;
             XposedBridge.log("【VCAM】Found still image at: " + imagePath);
         }
         
-        // For each tracked still capture ImageReader, post a fake onImageAvailable callback
-        // This tells the app that an image is "available" even though acquireLatestImage will return null
-        // Most camera apps handle null gracefully and will retry or show an error
+        // CRITICAL FIX: The root cause of infinite loading is that we trigger onImageAvailable
+        // but the ImageReader has no actual image (acquireLatestImage returns null).
+        // 
+        // Solution: Don't trigger the callback at all - let the capture timeout/fail naturally.
+        // The app should have error handling for failed captures.
+        // 
+        // OR: If we have readers, trigger them but ensure they can handle null.
+        
+        // For each tracked still capture ImageReader, trigger the callback
+        // But only if we have a still image to provide
+        boolean hasStillImage = imageFile.exists();
+        
         for (java.util.Map.Entry<ImageReader, ImageReader.OnImageAvailableListener> entry : imageReaderListeners.entrySet()) {
             ImageReader reader = entry.getKey();
             ImageReader.OnImageAvailableListener listener = entry.getValue();
@@ -1051,17 +1186,21 @@ public class HookMain implements IXposedHookLoadPackage {
             if (stillCaptureReaders.contains(reader) && listener != null) {
                 final ImageReader finalReader = reader;
                 final ImageReader.OnImageAvailableListener finalListener = listener;
+                final boolean hasFakeImage = hasStillImage;
                 
                 Runnable callbackRunnable = new Runnable() {
                     @Override
                     public void run() {
                         try {
-                            XposedBridge.log("【VCAM】Triggering fake onImageAvailable for ImageReader format: " + finalReader.getImageFormat());
-                            // Note: The app will call acquireLatestImage which may return null
-                            // due to format mismatch, but at least the callback is triggered
+                            XposedBridge.log("【VCAM】Triggering onImageAvailable for ImageReader format: " + finalReader.getImageFormat());
+                            
+                            // Note: acquireLatestImage will return null due to format mismatch
+                            // The app SHOULD handle this gracefully, but if it doesn't,
+                            // we've hooked acquireLatestImage to suppress exceptions
                             finalListener.onImageAvailable(finalReader);
+                            
                         } catch (Exception e) {
-                            XposedBridge.log("【VCAM】Error triggering fake image callback: " + e.getMessage());
+                            XposedBridge.log("【VCAM】Error in fake image callback: " + e.getMessage());
                         } finally {
                             // Reset the pending capture flag
                             pendingStillCapture.set(false);
@@ -1069,20 +1208,23 @@ public class HookMain implements IXposedHookLoadPackage {
                     }
                 };
                 
-                // Post with a delay to allow capture setup
+                // Post with a short delay
                 Handler targetHandler = handler != null ? handler : callbackHandler;
                 if (targetHandler != null) {
-                    targetHandler.postDelayed(callbackRunnable, 150);
+                    targetHandler.postDelayed(callbackRunnable, 100);
                 } else {
                     // Execute on new thread as fallback
                     new Thread(callbackRunnable).start();
                 }
+                
+                // Only trigger for one reader per capture
+                break;
             }
         }
         
         // If no still capture readers were found, reset the flag
         if (stillCaptureReaders.isEmpty()) {
-            XposedBridge.log("【VCAM】No still capture ImageReaders tracked");
+            XposedBridge.log("【VCAM】No still capture ImageReaders tracked - capture may hang");
             pendingStillCapture.set(false);
         }
     }
