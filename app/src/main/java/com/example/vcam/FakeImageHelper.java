@@ -13,6 +13,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.view.Surface;
+import android.media.FakeImage;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
