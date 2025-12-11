@@ -13,6 +13,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.view.Surface;
+import android.media.FakeImage;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -29,21 +30,6 @@ import de.robv.android.xposed.XposedBridge;
 public class FakeImageHelper {
     
     private static final String TAG = "【VCAM】FakeImageHelper";
-    private static ImageReader fakeJpegReader = null;
-    private static ImageReader fakeYuvReader = null;
-    private static HandlerThread handlerThread = null;
-    private static Handler handler = null;
-    
-    /**
-     * Initialize the fake image helper
-     */
-    public static void initialize() {
-        if (handlerThread == null) {
-            handlerThread = new HandlerThread("FakeImageHelper");
-            handlerThread.start();
-            handler = new Handler(handlerThread.getLooper());
-        }
-    }
     
     /**
      * Get the path to the still capture replacement image
@@ -102,64 +88,31 @@ public class FakeImageHelper {
     }
     
     /**
-     * Convert bitmap to JPEG byte array
+     * Create a FakeImage instance populated with the still image data
      */
-    public static byte[] bitmapToJpeg(Bitmap bitmap, int quality) {
-        if (bitmap == null) return null;
-        
-        try {
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, outputStream);
-            return outputStream.toByteArray();
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " Error converting bitmap to JPEG: " + e.getMessage());
+    public static Image createFakeImage(String videoPath, int width, int height, int format, long timestamp) {
+        Bitmap bitmap = loadStillImageBitmap(videoPath, width, height);
+        if (bitmap == null) {
+            XposedBridge.log(TAG + " Failed to load bitmap for FakeImage");
             return null;
         }
-    }
-    
-    /**
-     * Convert bitmap to NV21 (YUV) byte array
-     */
-    public static byte[] bitmapToNV21(Bitmap bitmap) {
-        if (bitmap == null) return null;
         
-        int width = bitmap.getWidth();
-        int height = bitmap.getHeight();
-        int[] pixels = new int[width * height];
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
-        
-        return rgb2YCbCr420(pixels, width, height);
-    }
-    
-    /**
-     * Convert RGB pixels to YCbCr420 (NV21) format
-     */
-    private static byte[] rgb2YCbCr420(int[] pixels, int width, int height) {
-        int len = width * height;
-        byte[] yuv = new byte[len * 3 / 2];
-        int y, u, v;
-        
-        for (int i = 0; i < height; i++) {
-            for (int j = 0; j < width; j++) {
-                int rgb = pixels[i * width + j] & 0x00FFFFFF;
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8) & 0xFF;
-                int b = rgb & 0xFF;
-                
-                y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                
-                y = Math.max(16, Math.min(255, y));
-                u = Math.max(0, Math.min(255, u));
-                v = Math.max(0, Math.min(255, v));
-                
-                yuv[i * width + j] = (byte) y;
-                yuv[len + (i >> 1) * width + (j & ~1)] = (byte) v;
-                yuv[len + (i >> 1) * width + (j & ~1) + 1] = (byte) u;
+        try {
+            if (format == 256 || format == ImageFormat.JPEG) { // JPEG
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream);
+                byte[] jpegData = outputStream.toByteArray();
+                bitmap.recycle();
+                return new FakeImage(width, height, format, jpegData, timestamp);
+            } else { // Assume YUV (NV21/YUV_420_888)
+                byte[][] yuvData = bitmapToYuv420Planes(bitmap);
+                bitmap.recycle();
+                return new FakeImage(width, height, format, yuvData, timestamp);
             }
+        } catch (Exception e) {
+            XposedBridge.log(TAG + " Error creating FakeImage: " + e.getMessage());
+            return null;
         }
-        return yuv;
     }
     
     /**
@@ -205,73 +158,5 @@ public class FakeImageHelper {
         }
         
         return new byte[][] {yPlane, uPlane, vPlane};
-    }
-    
-    /**
-     * Create a fake JPEG ImageReader and inject the still image
-     * This uses ImageWriter to push frames to a Surface connected to an ImageReader
-     */
-    public static void injectFakeJpegImage(String videoPath, int width, int height, 
-                                           ImageReader.OnImageAvailableListener listener, Handler callbackHandler) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            XposedBridge.log(TAG + " ImageWriter not available on this API level");
-            return;
-        }
-        
-        try {
-            initialize();
-            
-            // Load the still image
-            Bitmap bitmap = loadStillImageBitmap(videoPath, width, height);
-            if (bitmap == null) {
-                XposedBridge.log(TAG + " Failed to load still image bitmap");
-                return;
-            }
-            
-            // Create ImageReader for JPEG
-            final ImageReader jpegReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 2);
-            
-            // Set the listener
-            jpegReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
-                @Override
-                public void onImageAvailable(ImageReader reader) {
-                    XposedBridge.log(TAG + " Fake JPEG image available");
-                    if (listener != null) {
-                        listener.onImageAvailable(reader);
-                    }
-                }
-            }, callbackHandler != null ? callbackHandler : handler);
-            
-            // Get the surface and create ImageWriter
-            Surface surface = jpegReader.getSurface();
-            
-            // Note: ImageWriter doesn't support JPEG format directly
-            // We need to use a different approach for JPEG
-            XposedBridge.log(TAG + " JPEG injection setup complete - will rely on callback mechanism");
-            
-            bitmap.recycle();
-            
-        } catch (Exception e) {
-            XposedBridge.log(TAG + " Error injecting fake JPEG image: " + e.getMessage());
-        }
-    }
-    
-    /**
-     * Cleanup resources
-     */
-    public static void cleanup() {
-        if (fakeJpegReader != null) {
-            fakeJpegReader.close();
-            fakeJpegReader = null;
-        }
-        if (fakeYuvReader != null) {
-            fakeYuvReader.close();
-            fakeYuvReader = null;
-        }
-        if (handlerThread != null) {
-            handlerThread.quitSafely();
-            handlerThread = null;
-            handler = null;
-        }
     }
 }
