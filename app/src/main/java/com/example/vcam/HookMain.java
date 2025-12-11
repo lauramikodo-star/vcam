@@ -596,21 +596,12 @@ public class HookMain implements IXposedHookLoadPackage {
                     // Set pending capture flag so we can handle this in acquireLatestImage
                     pendingStillCapture.set(true);
                 } else if (surfaceInfo.contains("Surface(name=null)")) {
-                    // This is an ImageReader surface - only store if format is compatible
-                    if (surfaceFormat == null || surfaceFormat == FORMAT_RAW_PRIVATE || 
-                        (surfaceFormat != FORMAT_JPEG && surfaceFormat != FORMAT_YUV_420_888)) {
-                        if (c2_reader_Surfcae == null) {
-                            c2_reader_Surfcae = targetSurface;
-                            XposedBridge.log("【VCAM】Stored reader surface for video feed: " + surfaceInfo);
-                        } else {
-                            if ((!c2_reader_Surfcae.equals(targetSurface)) && c2_reader_Surfcae_1 == null) {
-                                c2_reader_Surfcae_1 = targetSurface;
-                                XposedBridge.log("【VCAM】Stored reader surface 1 for video feed: " + surfaceInfo);
-                            }
-                        }
-                    } else {
-                        XposedBridge.log("【VCAM】NOT storing reader surface due to format: 0x" + Integer.toHexString(surfaceFormat));
-                    }
+                    // This is an ImageReader surface or internal surface
+                    // Per user requirement: "use the video only to feed preview surface"
+                    // We must avoid feeding video to these unnamed surfaces as they are likely for analysis,
+                    // background processing, or capture, not user-facing preview.
+                    // Exceptions could be made if we knew for sure it was the preview, but usually preview has a name.
+                    XposedBridge.log("【VCAM】Skipping unnamed surface (likely ImageReader/Analysis): " + surfaceInfo);
                 } else {
                     if (c2_preview_Surfcae == null) {
                         c2_preview_Surfcae = targetSurface;
@@ -873,14 +864,28 @@ public class HookMain implements IXposedHookLoadPackage {
                 }
                 
                 // CRITICAL FIX: If this is a still capture ImageReader and we're in pending capture state,
-                // the app is trying to get the image but there's none available.
-                // We need to return null gracefully without throwing an exception.
+                // we inject the fake image instead of null or original image.
                 if (pendingStillCapture.get() && (format == FORMAT_JPEG || format == FORMAT_YUV_420_888)) {
-                    XposedBridge.log("【VCAM】Still capture ImageReader - returning null to prevent hang");
+                    XposedBridge.log("【VCAM】Still capture ImageReader - injecting fake image");
+
+                    try {
+                        // Create and return the fake image
+                        Image fakeImage = FakeImageHelper.createFakeImage(video_path, reader.getWidth(), reader.getHeight(), format, System.nanoTime());
+                        if (fakeImage != null) {
+                            // Return the fake image
+                            param.setResult(fakeImage);
+                            XposedBridge.log("【VCAM】Fake image injected successfully");
+                        } else {
+                            XposedBridge.log("【VCAM】Failed to create fake image - returning null");
+                            param.setResult(null);
+                        }
+                    } catch (Throwable t) {
+                         XposedBridge.log("【VCAM】Error injecting fake image: " + t.getMessage());
+                         param.setResult(null);
+                    }
+
                     // Reset pending state since we're "completing" the capture
                     pendingStillCapture.set(false);
-                    // Return null - app should handle this as a capture failure
-                    param.setResult(null);
                 }
             }
             
