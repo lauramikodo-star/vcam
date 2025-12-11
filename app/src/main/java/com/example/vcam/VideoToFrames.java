@@ -34,12 +34,22 @@ public class VideoToFrames implements Runnable {
 
     private LinkedBlockingQueue<byte[]> mQueue;
     private OutputImageFormat outputImageFormat;
-    private boolean stopDecode = false;
+    private volatile boolean stopDecode = false;
+    private volatile boolean isDecoding = false;
 
     private String videoFilePath;
     private Throwable throwable;
     private Thread childThread;
     private Surface play_surf;
+    
+    // Target dimensions for output scaling (from ImageReader)
+    private int targetWidth = 0;
+    private int targetHeight = 0;
+    // Actual video dimensions
+    private int videoWidth = 0;
+    private int videoHeight = 0;
+    // Flag to use original video resolution
+    private boolean useOriginalResolution = false;
 
     private Callback callback;
 
@@ -68,9 +78,44 @@ public class VideoToFrames implements Runnable {
             play_surf = player_surface;
         }
     }
+    
+    /**
+     * Set target dimensions for output
+     * If both are 0 or negative, use original video resolution
+     */
+    public void setTargetDimensions(int width, int height) {
+        this.targetWidth = width;
+        this.targetHeight = height;
+        if (width <= 0 || height <= 0) {
+            useOriginalResolution = true;
+        }
+    }
+    
+    /**
+     * Use original video resolution (don't override)
+     */
+    public void setUseOriginalResolution(boolean useOriginal) {
+        this.useOriginalResolution = useOriginal;
+    }
+    
+    /**
+     * Check if decoder is currently running
+     */
+    public boolean isDecoding() {
+        return isDecoding && !stopDecode;
+    }
 
     public void stopDecode() {
         stopDecode = true;
+        isDecoding = false;
+        // Interrupt the thread if it's waiting
+        if (childThread != null && childThread.isAlive()) {
+            try {
+                childThread.interrupt();
+            } catch (Exception e) {
+                XposedBridge.log("【VCAM】Error interrupting decode thread: " + e.getMessage());
+            }
+        }
     }
 
     public void decode(String videoFilePath) throws Throwable {
@@ -95,21 +140,37 @@ public class VideoToFrames implements Runnable {
     @SuppressLint("WrongConstant")
     public void videoDecode(String videoFilePath) throws IOException {
         XposedBridge.log("【VCAM】【decoder】开始解码");
+        isDecoding = true;
         MediaExtractor extractor = null;
         MediaCodec decoder = null;
         try {
             File videoFile = new File(videoFilePath);
+            if (!videoFile.exists()) {
+                XposedBridge.log("【VCAM】【decoder】Video file not found: " + videoFilePath);
+                isDecoding = false;
+                return;
+            }
+            
             extractor = new MediaExtractor();
             extractor.setDataSource(videoFilePath);
             int trackIndex = selectTrack(extractor);
             if (trackIndex < 0) {
                 XposedBridge.log("【VCAM】【decoder】No video track found in " + videoFilePath);
+                isDecoding = false;
+                return;
             }
             extractor.selectTrack(trackIndex);
             MediaFormat mediaFormat = extractor.getTrackFormat(trackIndex);
+            
+            // Get original video dimensions
+            videoWidth = mediaFormat.getInteger(MediaFormat.KEY_WIDTH);
+            videoHeight = mediaFormat.getInteger(MediaFormat.KEY_HEIGHT);
+            XposedBridge.log("【VCAM】【decoder】Original video resolution: " + videoWidth + "x" + videoHeight);
+            
             String mime = mediaFormat.getString(MediaFormat.KEY_MIME);
             decoder = MediaCodec.createDecoderByType(mime);
             showSupportedColorFormat(decoder.getCodecInfo().getCapabilitiesForType(mime));
+            
             if (play_surf == null) {
                 if (isColorFormatSupported(decodeColorFormat, decoder.getCodecInfo().getCapabilitiesForType(mime))) {
                     mediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, decodeColorFormat);
@@ -119,29 +180,75 @@ public class VideoToFrames implements Runnable {
                     XposedBridge.log("【VCAM】【decoder】unable to set decode color format, color format type " + decodeColorFormat + " not supported");
                 }
             } else {
-                if (HookMain.c2_ori_width > 0 && HookMain.c2_ori_height > 0) {
-                    mediaFormat.setInteger(MediaFormat.KEY_WIDTH, HookMain.c2_ori_width);
-                    mediaFormat.setInteger(MediaFormat.KEY_HEIGHT, HookMain.c2_ori_height);
-                    XposedBridge.log("【VCAM】【decoder】Overriding decode resolution to " + HookMain.c2_ori_width + "x" + HookMain.c2_ori_height);
+                // CRITICAL FIX: Use original video resolution when playing to surface
+                // Don't override resolution as it can cause aspect ratio issues
+                // The surface/SurfaceTexture will handle scaling
+                if (!useOriginalResolution && targetWidth > 0 && targetHeight > 0) {
+                    // Only override if explicitly requested AND dimensions match aspect ratio somewhat
+                    float videoAspect = (float) videoWidth / videoHeight;
+                    float targetAspect = (float) targetWidth / targetHeight;
+                    
+                    // If aspect ratios are very different, use original video resolution
+                    // to avoid severe stretching/compression
+                    if (Math.abs(videoAspect - targetAspect) > 0.5f) {
+                        XposedBridge.log("【VCAM】【decoder】Aspect ratio mismatch (video: " + videoAspect + 
+                                        ", target: " + targetAspect + ") - using original resolution");
+                        // Don't override - let the video play at original resolution
+                        // The surface will scale it appropriately
+                    } else {
+                        // Aspect ratios are similar enough, can use target dimensions
+                        mediaFormat.setInteger(MediaFormat.KEY_WIDTH, targetWidth);
+                        mediaFormat.setInteger(MediaFormat.KEY_HEIGHT, targetHeight);
+                        XposedBridge.log("【VCAM】【decoder】Using target resolution: " + targetWidth + "x" + targetHeight);
+                    }
+                } else {
+                    XposedBridge.log("【VCAM】【decoder】Using original video resolution: " + videoWidth + "x" + videoHeight);
                 }
             }
+            
             decodeFramesToImage(decoder, extractor, mediaFormat);
-            decoder.stop();
-            while (!stopDecode) {
-                extractor.seekTo(0, 0);
-                decodeFramesToImage(decoder, extractor, mediaFormat);
+            
+            // Safely stop decoder before looping
+            try {
                 decoder.stop();
+            } catch (IllegalStateException e) {
+                XposedBridge.log("【VCAM】【decoder】Error stopping decoder: " + e.getMessage());
             }
-        }catch (Exception e){
-            XposedBridge.log("【VCAM】[videofile]"+ e.toString());
+            
+            // Loop playback
+            while (!stopDecode && !Thread.currentThread().isInterrupted()) {
+                try {
+                    extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    decodeFramesToImage(decoder, extractor, mediaFormat);
+                    decoder.stop();
+                } catch (IllegalStateException e) {
+                    // Decoder may have been released or is in invalid state
+                    XposedBridge.log("【VCAM】【decoder】Loop decode error: " + e.getMessage());
+                    break;
+                }
+            }
+        } catch (IllegalStateException e) {
+            XposedBridge.log("【VCAM】[videofile] IllegalStateException: " + e.getMessage());
+            // Don't rethrow - just log and exit gracefully
+        } catch (Exception e) {
+            XposedBridge.log("【VCAM】[videofile] " + e.toString());
         } finally {
+            isDecoding = false;
             if (decoder != null) {
-                decoder.stop();
-                decoder.release();
+                try {
+                    decoder.stop();
+                    decoder.release();
+                } catch (Exception e) {
+                    // Ignore cleanup errors
+                }
                 decoder = null;
             }
             if (extractor != null) {
-                extractor.release();
+                try {
+                    extractor.release();
+                } catch (Exception e) {
+                    // Ignore cleanup errors
+                }
                 extractor = null;
             }
         }
@@ -168,14 +275,39 @@ public class VideoToFrames implements Runnable {
         boolean is_first = false;
         long startWhen = 0;
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-        decoder.configure(mediaFormat, play_surf, null, 0);
+        
+        try {
+            decoder.configure(mediaFormat, play_surf, null, 0);
+        } catch (IllegalStateException e) {
+            XposedBridge.log("【VCAM】【decoder】Configure error: " + e.getMessage());
+            // Try to reset decoder
+            try {
+                decoder.reset();
+                decoder.configure(mediaFormat, play_surf, null, 0);
+            } catch (Exception e2) {
+                XposedBridge.log("【VCAM】【decoder】Reset failed: " + e2.getMessage());
+                return;
+            }
+        } catch (IllegalArgumentException e) {
+            XposedBridge.log("【VCAM】【decoder】Invalid surface or format: " + e.getMessage());
+            return;
+        }
+        
         boolean sawInputEOS = false;
         boolean sawOutputEOS = false;
-        decoder.start();
+        
+        try {
+            decoder.start();
+        } catch (IllegalStateException e) {
+            XposedBridge.log("【VCAM】【decoder】Start error: " + e.getMessage());
+            return;
+        }
+        
         final int width = mediaFormat.getInteger(MediaFormat.KEY_WIDTH);
         final int height = mediaFormat.getInteger(MediaFormat.KEY_HEIGHT);
         int outputFrameCount = 0;
-        while (!sawOutputEOS && !stopDecode) {
+        
+        while (!sawOutputEOS && !stopDecode && !Thread.currentThread().isInterrupted()) {
             if (!sawInputEOS) {
                 int inputBufferId = decoder.dequeueInputBuffer(DEFAULT_TIMEOUT_US);
                 if (inputBufferId >= 0) {
@@ -226,13 +358,20 @@ public class VideoToFrames implements Runnable {
                     long sleepTime = info.presentationTimeUs / 1000 - (System.currentTimeMillis() - startWhen);
                     if (sleepTime > 0) {
                         try {
-                            Thread.sleep(sleepTime);
+                            Thread.sleep(Math.min(sleepTime, 100)); // Cap sleep time to 100ms max
                         } catch (InterruptedException e) {
-                            XposedBridge.log("【VCAM】" + e.toString());
-                            XposedBridge.log("【VCAM】线程延迟出错");
+                            XposedBridge.log("【VCAM】Decode thread interrupted");
+                            stopDecode = true;
+                            break;
                         }
                     }
-                    decoder.releaseOutputBuffer(outputBufferId, true);
+                    
+                    try {
+                        decoder.releaseOutputBuffer(outputBufferId, true);
+                    } catch (IllegalStateException e) {
+                        XposedBridge.log("【VCAM】【decoder】Error releasing buffer: " + e.getMessage());
+                        break;
+                    }
                 }
             }
         }
